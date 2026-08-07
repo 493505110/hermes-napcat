@@ -17,6 +17,8 @@ Configuration in ~/.hermes/config.yaml:
           allow_from: []             # QQ numbers allowed for DMs
           group_policy: "open"       # open | allowlist | disabled
           group_allow_from: []       # falls back to allow_from
+          friend_policy: "open"      # open | allowlist | disabled (friend-add handling)
+          friend_allow_from: []      # QQ ids auto-accepted as friends (falls back to allow_from)
           admins: []                 # QQ numbers that can use admin-only tools
           media_max_mb: 5
 """
@@ -66,6 +68,26 @@ _QQ_TEXT_LIMIT = 4500
 _AUDIO_EXTS = {".mp3", ".opus", ".ogg", ".wav", ".flac", ".m4a", ".aac", ".silk", ".amr"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".wmv"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".ico", ".svg"}
+
+
+def _coerce_qid_set(raw) -> set[str]:
+    """Turn a QQ-id allowlist into a set of str, accepting a real list, a comma
+    string ("123,456"), or a JSON-string list ('["123","456"]')."""
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if txt.startswith("[") and txt.endswith("]"):
+            try:
+                return {str(x).strip() for x in json.loads(txt)}
+            except Exception:
+                pass
+        if txt:
+            return {x.strip() for x in txt.split(",") if x.strip()}
+        return set()
+    if isinstance(raw, (list, tuple, set)):
+        return {str(x).strip() for x in raw if str(x).strip()}
+    return {str(raw).strip()} if str(raw).strip() else set()
 
 # ── Markdown → QQ plain-text ──────────────────────────────────────────────────
 
@@ -323,6 +345,15 @@ class NapCatAdapter(BasePlatformAdapter):
         self._group_allow_from: list[str] = [str(x) for x in extra.get("group_allow_from", [])]
         self._media_max_mb: int = int(extra.get("media_max_mb", 5))
         self._admins: list[str] = [str(x) for x in extra.get("admins", [])]
+        # Friend-add policy.  open     = auto-accept everyone (default).
+        #                   allowlist = only accept QQ numbers in friend_allow_from/admins.
+        #                   disabled  = never auto-handle (log only).
+        self._friend_policy: str = str(extra.get("friend_policy", "open")).lower()
+        # Robust friend allowlist: extra config may hold admins/allow_from as either
+        # a real list, a comma string ("123,456"), or a JSON-string list
+        # ('["123","456"]').  Parse all three so the allowlist check works regardless.
+        friend_source = extra.get("friend_allow_from", extra.get("allow_from"))
+        self._friend_allow: set[str] = _coerce_qid_set(friend_source) | _coerce_qid_set(extra.get("admins"))
 
         self._runner: aiohttp.web.AppRunner | None = None
         self._active_ws: set[aiohttp.web.WebSocketResponse] = set()
@@ -396,12 +427,52 @@ class NapCatAdapter(BasePlatformAdapter):
             data: dict = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if data.get("post_type") != "message":
+        post_type = data.get("post_type")
+        if post_type == "request":
+            await self._handle_request(data)
+            return
+        if post_type != "message":
             return
         try:
             await self._process_message(data)
         except Exception:
             logger.exception("NapCat: error processing message")
+
+    async def _handle_request(self, data: dict) -> None:
+        """Handle OneBot 11 request events (friend requests).
+
+        Friend requests carry ``post_type='request'`` / ``request_type='friend'``.
+        Policy comes from ``friend_policy`` extra config:
+          open     = auto-accept everyone (default)
+          allowlist = only accept QQ numbers in friend_allow_from/admins/allow_from
+          disabled  = never auto-handle (log only)
+        """
+        if data.get("request_type") != "friend":
+            logger.info("NapCat: ignoring %s request event", data.get("request_type"))
+            return
+        flag = data.get("flag", "")
+        user_id = str(data.get("user_id", ""))
+        if self._friend_policy == "open":
+            approve = True
+        elif self._friend_policy == "allowlist":
+            approve = user_id in self._friend_allow
+        else:  # disabled
+            logger.info("NapCat: friend request from %s — friend_policy=disabled, ignoring", user_id)
+            return
+        logger.info(
+            "NapCat: friend request from %s (flag=%s) — %s",
+            user_id, flag, "accepting" if approve else "rejecting (not in allowlist)",
+        )
+        try:
+            resp = await call_onebot_api(
+                self._http_api,
+                "set_friend_add_request",
+                {"flag": flag, "approve": approve},
+                self._access_token or None,
+            )
+            logger.info("NapCat: friend request handled, api=%s", resp)
+        except Exception:
+            logger.exception("NapCat: failed to handle friend request")
 
     async def _process_message(self, event: dict) -> None:
         is_group = event.get("message_type") == "group"
