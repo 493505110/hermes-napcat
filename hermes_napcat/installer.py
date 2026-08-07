@@ -15,11 +15,15 @@ Uninstall restores the backups and removes ``gateway/platforms/napcat.py``.
 from __future__ import annotations
 
 import importlib.util
+import ast
+import logging
 import os
 import re
 import shutil
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ── Locate Hermes ─────────────────────────────────────────────────────────────
 
@@ -80,6 +84,34 @@ def _read(path: Path) -> str:
 
 def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
+
+
+def _syntax_error(path: Path, content: str) -> str | None:
+    """Return a human message if *content* is not valid Python, else None.
+
+    Used to catch a mis-pasted hunk BEFORE it is written to disk, so a bad
+    edit can never crash the gateway on the next restart.
+    """
+    if not path.name.endswith(".py"):
+        return None
+    try:
+        ast.parse(content, filename=str(path))
+    except SyntaxError as exc:
+        return f"{path}: {exc.msg} at line {exc.lineno} col {exc.offset}"
+    return None
+
+
+def _write_checked(path: Path, content: str, *, rollback_to: Path | None = None) -> bool:
+    """Write *content* only if it parses; on syntax error restore a backup and
+    return False so the caller can abort.  Never leaves a broken .py behind."""
+    err = _syntax_error(path, content)
+    if err is None:
+        _write(path, content)
+        return True
+    if rollback_to is not None and rollback_to.exists():
+        shutil.copy2(rollback_to, path)
+    logger.warning("hermes-napcat: refusing to write broken source: %s", err)
+    return False
 
 
 # ── Step 1: copy adapter ──────────────────────────────────────────────────────
@@ -192,10 +224,12 @@ def _patch_run(hermes_root: Path) -> None:
     if not func_match:
         raise RuntimeError("Could not find _create_adapter in gateway/run.py")
     func_pos = func_match.start()
-
-    # Detect body indentation from the first elif/return inside the function
-    body_match = re.search(r'\n([ \t]+)(elif|return)\s', src[func_pos:])
-    body_indent = body_match.group(1) if body_match else "        "
+    # Body indentation is deterministic: def's own indent + 4 spaces.
+    # (Never guess from the first elif/return inside the function — that can be
+    #  a NESTED block and yields a wrong indent, which is what made the old code
+    #  paste the hunk into an unrelated `if _action == "skip":` block → dangling
+    #  elif → SyntaxError → gateway crash loop. See hermes-ops skill.)
+    body_indent = func_match.group(1) + "    "
     inner_indent = body_indent + "    "
 
     napcat_block = (
@@ -207,30 +241,33 @@ def _patch_run(hermes_root: Path) -> None:
         f"{inner_indent}return NapCatAdapter(config)\n"
     )
 
-    # Insert before the final "return None" inside _create_adapter
-    return_match = re.search(
-        r'(?m)^' + re.escape(body_indent) + r'return None\b',
-        src[func_pos:],
-    )
-    if return_match:
-        insert_pos = func_pos + return_match.start()
-        src = src[:insert_pos] + napcat_block + src[insert_pos:]
-    else:
-        # Fallback: insert after the last elif at body indent level
-        last_elif = list(re.finditer(
-            r'(?m)^' + re.escape(body_indent) + r'elif platform == Platform\.\w+:',
-            src[func_pos:],
-        ))
-        if not last_elif:
-            raise RuntimeError("Could not find adapter dispatch in gateway/run.py")
-        pos = func_pos + last_elif[-1].start()
-        next_block = re.search(
+    # Insert AFTER the LAST `elif platform == Platform.X:` at body level, so the
+    # hunk always lands inside the adapter dispatch chain (never mid-block).
+    last_elif = list(re.finditer(
+        r'(?m)^' + re.escape(body_indent) + r'elif platform == Platform\.\w+:', src))
+    if last_elif:
+        pos = last_elif[-1].start()
+        # The end of that elif's body is the next body-level statement.
+        next_stmt = re.search(
             r'\n' + re.escape(body_indent) + r'(elif|else|return)', src[pos:]
         )
-        insert_pos = pos + next_block.start(0) + 1 if next_block else len(src)
-        src = src[:insert_pos] + napcat_block + src[insert_pos:]
+        insert_pos = pos + next_stmt.start(0) + 1 if next_stmt else len(src)
+        new_src = src[:insert_pos] + napcat_block + src[insert_pos:]
+    else:
+        # Fallback: insert before the trailing `return None` at body level.
+        return_match = re.search(
+            r'(?m)^' + re.escape(body_indent) + r'return None\b', src)
+        if not return_match:
+            raise RuntimeError("Could not find adapter dispatch in gateway/run.py")
+        insert_pos = return_match.start()
+        new_src = src[:insert_pos] + napcat_block + src[insert_pos:]
 
-    _write(path, src)
+    # Safety net: refuse to write broken source.  If the hunk somehow lands
+    # wrong, restore the backup and abort instead of crashing the gateway.
+    bak = path.with_suffix(path.suffix + ".napcat.bak")
+    if not _write_checked(path, new_src, rollback_to=bak):
+        print("  [!] gateway/run.py patch produced invalid syntax — rolled back, aborting")
+        raise RuntimeError("gateway/run.py patch failed syntax check (see log)")
     print("  [+] Patched gateway/run.py (_create_adapter)")
 
 
